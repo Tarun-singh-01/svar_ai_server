@@ -43,7 +43,7 @@ async def transcribe_audio(file: UploadFile):
     # Replace this section with your actual AI calls.
     print(f"Simulating AI processing for file: {file.filename}")
     import time
-    time.sleep(5) # Simulate a 5-second AI process
+    # time.sleep(5) # Simulate a 5-second AI process
     transcript_result = f"This is the transcript for {file.filename}."
     summary_result = "This is the summary."
     # --- End of DUMMY data section ---
