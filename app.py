@@ -3,10 +3,7 @@
 import os
 import openai
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from pydub import AudioSegment
 from sarvamai import SarvamAI
-import glob
-import json
 import shutil
 
 # --- Load Environment Variables ---
@@ -20,17 +17,14 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SARVAM_API_KEY or not OPENAI_API_KEY:
-    # This will cause the server to fail on startup if keys are missing
-    raise RuntimeError("API keys for Sarvam and OpenAI must be set in .env or Render Environment")
+    raise RuntimeError("API keys for Sarvam and OpenAI must be set.")
 
 sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Helper Functions from your working code ---
-
+# --- Helper Functions ---
 def format_diarized_transcript(sarvam_result: dict) -> str:
     """Formats the diarized output from Sarvam AI into a readable string."""
-    # The documentation/output shows 'utterances' is the key, not 'segments'
     utterances = sarvam_result.get("utterances")
     if not utterances:
         return sarvam_result.get("text", "No content found.")
@@ -46,31 +40,12 @@ def format_diarized_transcript(sarvam_result: dict) -> str:
 def generate_summary_prompt(template_type: str, transcript: str) -> str:
     """Generates a specific prompt for GPT-4o based on the selected template."""
     prompts = {
-        "meeting_notes": f"""
-You are a professional meeting assistant. Analyze the following meeting transcript and generate a structured summary. The summary must include these three sections in Markdown format:
-1.  **Key Decisions:** List the main decisions that were made.
-2.  **Action Items:** List all tasks or action items discussed, mentioning who is assigned to each.
-3.  **Discussion Points:** Briefly summarize the key topics that were discussed.
-
-Transcript:
----
-{transcript}
-""",
-        "todo_list": f"""
-You are an expert at creating task lists. Extract all actionable tasks and to-do items from the following transcript.
-Format the output as a clear Markdown checklist. If the person assigned to the task is mentioned, include their name.
-If no action items are found, simply state "No action items were identified."
-
-Transcript:
----
-{transcript}
-""",
+        "meeting_notes": f"Summarize the key decisions, action items, and discussion points from this transcript:\n\n{transcript}",
+        "todo_list": f"Extract all actionable tasks and to-do items from this transcript into a checklist:\n\n{transcript}",
     }
-    # Fallback for any other template type
-    return prompts.get(template_type, f"Please provide a concise summary of the following transcript:\n\n{transcript}")
+    return prompts.get(template_type, f"Provide a concise summary of this transcript:\n\n{transcript}")
 
 # --- API Endpoint ---
-
 @app.get("/")
 def read_root():
     return {"status": "Svar AI server is running"}
@@ -78,23 +53,17 @@ def read_root():
 @app.post("/transcribe")
 def transcribe_audio(
     file: UploadFile = File(...),
-    template_type: str = Form("meeting_notes") # Default to meeting_notes
+    template_type: str = Form("meeting_notes")
 ):
-    """
-    Receives an audio file, transcribes with diarization, and generates a templated summary.
-    """
     temp_dir = "temp_processing"
-    output_dir = os.path.join(temp_dir, "sarvam_output")
-    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(temp_dir, exist_ok=True)
     
     temp_audio_path = os.path.join(temp_dir, file.filename if file.filename else "audio.tmp")
     
     try:
-        # Save uploaded file
         with open(temp_audio_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
         
-        # --- Saarika Transcription Job ---
         print("Starting Sarvam AI transcription job...")
         job = sarvam_client.speech_to_text_job.create_job(
             language_code="en-IN",
@@ -109,21 +78,11 @@ def transcribe_audio(
         if job.is_failed():
             raise HTTPException(status_code=502, detail=f"Sarvam job failed: {job.get_status().get('reason')}")
         
-        # Use the correct download method
-        job.download_outputs(output_dir=output_dir)
-        print("Transcription job outputs downloaded.")
-
-        # --- Process Results ---
-        output_files = glob.glob(os.path.join(output_dir, "*.json"))
-        if not output_files:
-            raise HTTPException(status_code=404, detail="No transcript output file found from Sarvam.")
-
-        with open(output_files[0]) as jf:
-            sarvam_result = json.load(jf)
+        sarvam_result = job.get_outputs()[0]
+        print("Transcription job successful.")
         
         diarized_transcript = format_diarized_transcript(sarvam_result)
         
-        # --- Generate Templated Summary ---
         print("Generating summary with GPT-4o...")
         summary_prompt = generate_summary_prompt(template_type, diarized_transcript)
         
@@ -135,7 +94,7 @@ def transcribe_audio(
         print("Summary generated successfully.")
 
         return {
-            "transcript": sarvam_result, # Send the full structured transcript
+            "transcript": sarvam_result,
             "summary": summary
         }
 
@@ -146,6 +105,5 @@ def transcribe_audio(
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
     finally:
-        # Clean up the temporary directory
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
