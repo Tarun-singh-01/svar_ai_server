@@ -4,9 +4,8 @@ import os
 import openai
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from sarvamai import SarvamAI
-import glob
-import json
 import shutil
+import json
 
 # --- Load Environment Variables ---
 from dotenv import load_dotenv
@@ -26,19 +25,23 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # --- Helper Functions ---
 def format_diarized_transcript(sarvam_result: dict) -> str:
-    utterances = sarvam_result.get("utterances")
-    if not utterances:
-        return sarvam_result.get("text", "No content found.")
+    """Formats the diarized JSON from Sarvam AI into a readable string."""
+    # The response contains 'diarized_transcript' -> 'entries'
+    entries = sarvam_result.get("diarized_transcript", {}).get("entries", [])
+    if not entries:
+        # Fallback to the plain transcript if no diarization is found
+        return sarvam_result.get("transcript", "No content found.")
 
     formatted_lines = []
-    for utterance in utterances:
-        speaker = utterance.get("speaker", "Unknown Speaker").replace('_', ' ').title()
-        text = utterance.get("text", "")
+    for entry in entries:
+        speaker = entry.get("speaker_id", "Unknown Speaker").replace('_', ' ').title()
+        text = entry.get("transcript", "")
         formatted_lines.append(f"**{speaker}:** {text}")
     
     return "\n".join(formatted_lines).strip()
 
 def generate_summary_prompt(template_type: str, transcript: str) -> str:
+    """Generates a specific prompt for GPT-4o based on the selected template."""
     prompts = {
         "meeting_notes": f"Summarize the key decisions, action items, and discussion points from this transcript:\n\n{transcript}",
         "todo_list": f"Extract all actionable tasks and to-do items from this transcript into a checklist:\n\n{transcript}",
@@ -65,13 +68,10 @@ def transcribe_audio(
         with open(temp_audio_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
         
-        # --- Saarika Transcription Job ---
         print("Starting Sarvam AI transcription job...")
         job = sarvam_client.speech_to_text_job.create_job(
-            language_code="en-IN",
-            model="saarika:v2.5",
-            with_timestamps=True,
-            with_diarization=True,
+            language_code="en-IN", model="saarika:v2.5",
+            with_timestamps=True, with_diarization=True
         )
         job.upload_files(file_paths=[temp_audio_path])
         job.start()
@@ -80,24 +80,15 @@ def transcribe_audio(
         if job.is_failed():
             raise HTTPException(status_code=502, detail=f"Sarvam job failed: {job.get_status().get('reason')}")
         
-        # --- THIS IS THE FIX ---
-        # Use download_outputs() to save the result JSON to a file
-        job.download_outputs(output_dir=output_dir)
-        print("Transcription job outputs downloaded.")
-
-        # Find the resulting JSON file in the output directory
-        output_files = glob.glob(os.path.join(output_dir, "*.json"))
-        if not output_files:
-            raise HTTPException(status_code=404, detail="No transcript output file found from Sarvam.")
-
-        # Read the result from the JSON file
-        with open(output_files[0]) as jf:
-            sarvam_result = json.load(jf)
+        sarvam_result_json = job.get_outputs()[0]
+        print("Transcription job successful.")
         
-        plain_text_transcript = format_diarized_transcript(sarvam_result)
+        # --- THIS IS THE FIX ---
+        # 1. Format the complex JSON into a simple, readable string
+        diarized_transcript_string = format_diarized_transcript(sarvam_result_json)
         
         print("Generating summary with GPT-4o...")
-        summary_prompt = generate_summary_prompt(template_type, plain_text_transcript)
+        summary_prompt = generate_summary_prompt(template_type, diarized_transcript_string)
         
         summary_completion = openai_client.chat.completions.create(
             model="gpt-4o",
@@ -106,18 +97,17 @@ def transcribe_audio(
         summary = summary_completion.choices[0].message.content
         print("Summary generated successfully.")
 
+        # 2. Return the SIMPLE STRING for the transcript, not the complex object
         return {
-            "transcript": sarvam_result,
+            "transcript": diarized_transcript_string,
             "summary": summary
         }
 
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
+        if isinstance(e, HTTPException): raise e
         print(f"An unexpected error occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
     finally:
-        # Clean up the temporary directories
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
