@@ -4,7 +4,7 @@ import os
 from fastapi import FastAPI, UploadFile, HTTPException
 from dotenv import load_dotenv
 
-# Import the official SDKs
+# Import the official SYNCHRONOUS SDKs
 from sarvamai import SarvamAI
 from openai import OpenAI
 
@@ -31,16 +31,21 @@ def read_root():
     return {"status": "Svar AI server is running"}
 
 @app.post("/transcribe")
-async def transcribe_audio(file: UploadFile):
+def transcribe_audio(file: UploadFile):
+    """
+    This is a synchronous function. FastAPI will run it in a background
+    thread pool to avoid blocking the server.
+    """
     if not sarvam_client or not openai_client:
         raise HTTPException(status_code=500, detail="API keys are not configured on the server.")
 
     file_path = f"temp_{file.filename}"
     try:
+        # Save the uploaded file temporarily
         with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
+            buffer.write(file.file.read())
 
-        # --- Step 1: Transcription with Sarvam AI ---
+        # --- Step 1: Transcription with Sarvam AI (Synchronous) ---
         print("Starting Sarvam AI transcription job...")
         job = sarvam_client.speech_to_text_job.create_job(
             model="saarika:v2.5",
@@ -49,18 +54,14 @@ async def transcribe_audio(file: UploadFile):
             language_code="en-IN",
         )
         
-        await job.upload_files(file_paths=[file_path])
-        
-        # --- THIS IS THE FIX ---
-        # The job.start() method is synchronous and doesn't need to be awaited.
+        job.upload_files(file_paths=[file_path])
         job.start() 
-        
-        await job.wait_until_complete(poll_interval=5, timeout=300)
+        job.wait_until_complete(poll_interval=5, timeout=300)
 
         if job.is_failed():
             raise RuntimeError(f"Transcription failed: {job.get_status().reason}")
 
-        result_list = await job.get_outputs()
+        result_list = job.get_outputs()
         if not result_list:
             raise RuntimeError("No output found from transcription job.")
         
@@ -71,6 +72,7 @@ async def transcribe_audio(file: UploadFile):
         print(f"An error occurred during transcription: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        # Clean up the temporary file
         if os.path.exists(file_path):
             os.remove(file_path)
 
