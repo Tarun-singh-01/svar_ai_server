@@ -4,6 +4,8 @@ import os
 import openai
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from sarvamai import SarvamAI
+import glob
+import json
 import shutil
 
 # --- Load Environment Variables ---
@@ -24,7 +26,6 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # --- Helper Functions ---
 def format_diarized_transcript(sarvam_result: dict) -> str:
-    """Formats the diarized output from Sarvam AI into a readable string."""
     utterances = sarvam_result.get("utterances")
     if not utterances:
         return sarvam_result.get("text", "No content found.")
@@ -38,7 +39,6 @@ def format_diarized_transcript(sarvam_result: dict) -> str:
     return "\n".join(formatted_lines).strip()
 
 def generate_summary_prompt(template_type: str, transcript: str) -> str:
-    """Generates a specific prompt for GPT-4o based on the selected template."""
     prompts = {
         "meeting_notes": f"Summarize the key decisions, action items, and discussion points from this transcript:\n\n{transcript}",
         "todo_list": f"Extract all actionable tasks and to-do items from this transcript into a checklist:\n\n{transcript}",
@@ -56,7 +56,8 @@ def transcribe_audio(
     template_type: str = Form("meeting_notes")
 ):
     temp_dir = "temp_processing"
-    os.makedirs(temp_dir, exist_ok=True)
+    output_dir = os.path.join(temp_dir, "sarvam_output")
+    os.makedirs(output_dir, exist_ok=True)
     
     temp_audio_path = os.path.join(temp_dir, file.filename if file.filename else "audio.tmp")
     
@@ -64,6 +65,7 @@ def transcribe_audio(
         with open(temp_audio_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
         
+        # --- Saarika Transcription Job ---
         print("Starting Sarvam AI transcription job...")
         job = sarvam_client.speech_to_text_job.create_job(
             language_code="en-IN",
@@ -78,13 +80,24 @@ def transcribe_audio(
         if job.is_failed():
             raise HTTPException(status_code=502, detail=f"Sarvam job failed: {job.get_status().get('reason')}")
         
-        sarvam_result = job.get_outputs()[0]
-        print("Transcription job successful.")
+        # --- THIS IS THE FIX ---
+        # Use download_outputs() to save the result JSON to a file
+        job.download_outputs(output_dir=output_dir)
+        print("Transcription job outputs downloaded.")
+
+        # Find the resulting JSON file in the output directory
+        output_files = glob.glob(os.path.join(output_dir, "*.json"))
+        if not output_files:
+            raise HTTPException(status_code=404, detail="No transcript output file found from Sarvam.")
+
+        # Read the result from the JSON file
+        with open(output_files[0]) as jf:
+            sarvam_result = json.load(jf)
         
-        diarized_transcript = format_diarized_transcript(sarvam_result)
+        plain_text_transcript = format_diarized_transcript(sarvam_result)
         
         print("Generating summary with GPT-4o...")
-        summary_prompt = generate_summary_prompt(template_type, diarized_transcript)
+        summary_prompt = generate_summary_prompt(template_type, plain_text_transcript)
         
         summary_completion = openai_client.chat.completions.create(
             model="gpt-4o",
@@ -105,5 +118,6 @@ def transcribe_audio(
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
     finally:
+        # Clean up the temporary directories
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
