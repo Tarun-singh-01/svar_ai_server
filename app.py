@@ -1,109 +1,151 @@
 # app.py
 
 import os
-from fastapi import FastAPI, UploadFile, HTTPException
-from dotenv import load_dotenv
-
-# Import the official SYNCHRONOUS SDKs
+import openai
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from pydub import AudioSegment
 from sarvamai import SarvamAI
-from openai import OpenAI
+import glob
+import json
+import shutil
 
 # --- Load Environment Variables ---
+from dotenv import load_dotenv
 load_dotenv()
 
-# --- Initialize API Clients ---
-SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-sarvam_client = None
-openai_client = None
-
-if SARVAM_API_KEY:
-    sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
-
-if OPENAI_API_KEY:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
 app = FastAPI()
+
+# --- Initialize API Clients ---
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not SARVAM_API_KEY or not OPENAI_API_KEY:
+    # This will cause the server to fail on startup if keys are missing
+    raise RuntimeError("API keys for Sarvam and OpenAI must be set in .env or Render Environment")
+
+sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+# --- Helper Functions from your working code ---
+
+def format_diarized_transcript(sarvam_result: dict) -> str:
+    """Formats the diarized output from Sarvam AI into a readable string."""
+    # The documentation/output shows 'utterances' is the key, not 'segments'
+    utterances = sarvam_result.get("utterances")
+    if not utterances:
+        return sarvam_result.get("text", "No content found.")
+
+    formatted_lines = []
+    for utterance in utterances:
+        speaker = utterance.get("speaker", "Unknown Speaker").replace('_', ' ').title()
+        text = utterance.get("text", "")
+        formatted_lines.append(f"**{speaker}:** {text}")
+    
+    return "\n".join(formatted_lines).strip()
+
+def generate_summary_prompt(template_type: str, transcript: str) -> str:
+    """Generates a specific prompt for GPT-4o based on the selected template."""
+    prompts = {
+        "meeting_notes": f"""
+You are a professional meeting assistant. Analyze the following meeting transcript and generate a structured summary. The summary must include these three sections in Markdown format:
+1.  **Key Decisions:** List the main decisions that were made.
+2.  **Action Items:** List all tasks or action items discussed, mentioning who is assigned to each.
+3.  **Discussion Points:** Briefly summarize the key topics that were discussed.
+
+Transcript:
+---
+{transcript}
+""",
+        "todo_list": f"""
+You are an expert at creating task lists. Extract all actionable tasks and to-do items from the following transcript.
+Format the output as a clear Markdown checklist. If the person assigned to the task is mentioned, include their name.
+If no action items are found, simply state "No action items were identified."
+
+Transcript:
+---
+{transcript}
+""",
+    }
+    # Fallback for any other template type
+    return prompts.get(template_type, f"Please provide a concise summary of the following transcript:\n\n{transcript}")
+
+# --- API Endpoint ---
 
 @app.get("/")
 def read_root():
     return {"status": "Svar AI server is running"}
 
 @app.post("/transcribe")
-def transcribe_audio(file: UploadFile):
+def transcribe_audio(
+    file: UploadFile = File(...),
+    template_type: str = Form("meeting_notes") # Default to meeting_notes
+):
     """
-    This is a synchronous function. FastAPI will run it in a background
-    thread pool to avoid blocking the server.
+    Receives an audio file, transcribes with diarization, and generates a templated summary.
     """
-    if not sarvam_client or not openai_client:
-        raise HTTPException(status_code=500, detail="API keys are not configured on the server.")
-
-    file_path = f"temp_{file.filename}"
+    temp_dir = "temp_processing"
+    output_dir = os.path.join(temp_dir, "sarvam_output")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    temp_audio_path = os.path.join(temp_dir, file.filename if file.filename else "audio.tmp")
+    
     try:
-        # Save the uploaded file temporarily
-        with open(file_path, "wb") as buffer:
-            buffer.write(file.file.read())
-
-        # --- Step 1: Transcription with Sarvam AI (Synchronous) ---
+        # Save uploaded file
+        with open(temp_audio_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        # --- Saarika Transcription Job ---
         print("Starting Sarvam AI transcription job...")
         job = sarvam_client.speech_to_text_job.create_job(
-            model="saarika:v2.5",
-            with_diarization=True,
-            with_timestamps=True,
             language_code="en-IN",
+            model="saarika:v2.5",
+            with_timestamps=True,
+            with_diarization=True,
         )
-        
-        job.upload_files(file_paths=[file_path])
-        job.start() 
-        job.wait_until_complete(poll_interval=5, timeout=300)
+        job.upload_files(file_paths=[temp_audio_path])
+        job.start()
+        job.wait_until_complete(timeout=300)
 
         if job.is_failed():
-            raise RuntimeError(f"Transcription failed: {job.get_status().reason}")
-
-        result_list = job.get_outputs()
-        if not result_list:
-            raise RuntimeError("No output found from transcription job.")
+            raise HTTPException(status_code=502, detail=f"Sarvam job failed: {job.get_status().get('reason')}")
         
-        transcription_result = result_list[0]
-        print("Transcription successful.")
+        # Use the correct download method
+        job.download_outputs(output_dir=output_dir)
+        print("Transcription job outputs downloaded.")
 
-    except Exception as e:
-        print(f"An error occurred during transcription: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Clean up the temporary file
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # --- Process Results ---
+        output_files = glob.glob(os.path.join(output_dir, "*.json"))
+        if not output_files:
+            raise HTTPException(status_code=404, detail="No transcript output file found from Sarvam.")
 
-    # --- Step 2: Format Transcript for Summarization ---
-    plain_text_transcript = ""
-    if "utterances" in transcription_result:
-        for utterance in transcription_result["utterances"]:
-            speaker = utterance.get("speaker", "Unknown Speaker")
-            text = utterance.get("text", "")
-            plain_text_transcript += f"{speaker}: {text}\n"
-    else:
-        plain_text_transcript = transcription_result.get("text", "No text found.")
-
-    # --- Step 3: Summarization with GPT-4o ---
-    summary_result = "Could not generate summary."
-    try:
-        print("Sending transcript to GPT-4o for summarization...")
-        completion = openai_client.chat.completions.create(
+        with open(output_files[0]) as jf:
+            sarvam_result = json.load(jf)
+        
+        diarized_transcript = format_diarized_transcript(sarvam_result)
+        
+        # --- Generate Templated Summary ---
+        print("Generating summary with GPT-4o...")
+        summary_prompt = generate_summary_prompt(template_type, diarized_transcript)
+        
+        summary_completion = openai_client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are an expert assistant who creates concise, professional summaries of meeting transcripts, including key discussion points and action items."},
-                {"role": "user", "content": f"Please summarize the following transcript:\n\n{plain_text_transcript}"}
-            ]
+            messages=[{"role": "user", "content": summary_prompt}]
         )
-        summary_result = completion.choices[0].message.content or "Summary was empty."
-        print("Summarization successful.")
-    except Exception as e:
-        print(f"Error during summarization: {e}")
-        summary_result = "Error: Could not generate summary."
+        summary = summary_completion.choices[0].message.content
+        print("Summary generated successfully.")
 
-    return {
-        "transcript": transcription_result,
-        "summary": summary_result
-    }
+        return {
+            "transcript": sarvam_result, # Send the full structured transcript
+            "summary": summary
+        }
+
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        print(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+    finally:
+        # Clean up the temporary directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
