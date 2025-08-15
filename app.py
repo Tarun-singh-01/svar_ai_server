@@ -3,6 +3,8 @@
 import os
 from fastapi import FastAPI, UploadFile, HTTPException
 from dotenv import load_dotenv
+
+# Import the official SDKs
 from sarvamai import SarvamAI
 from openai import OpenAI
 
@@ -30,11 +32,6 @@ def read_root():
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile):
-    """
-    This endpoint handles the full process:
-    1. Transcribes audio with Sarvam AI (including diarization).
-    2. Summarizes the transcript with OpenAI's GPT-4o.
-    """
     if not sarvam_client or not openai_client:
         raise HTTPException(status_code=500, detail="API keys are not configured on the server.")
 
@@ -51,8 +48,13 @@ async def transcribe_audio(file: UploadFile):
             with_timestamps=True,
             language_code="en-IN",
         )
+        
         await job.upload_files(file_paths=[file_path])
-        await job.start()
+        
+        # --- THIS IS THE FIX ---
+        # The job.start() method is synchronous and doesn't need to be awaited.
+        job.start() 
+        
         await job.wait_until_complete(poll_interval=5, timeout=300)
 
         if job.is_failed():
