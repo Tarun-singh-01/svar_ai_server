@@ -1,4 +1,4 @@
-# app.py (with active polling loop)
+# app.py (with active polling loop - FINAL FIX)
 
 import os
 import openai
@@ -76,12 +76,13 @@ def transcribe_audio(
         job.start()
         print("Step 2b: Job started. Waiting for completion...")
 
-        # --- NEW POLLING LOGIC ---
+        # --- POLLING LOGIC WITH CORRECTION ---
         start_time = time.time()
         timeout = 300 # 5 minutes
         while True:
             status = job.get_status()
-            current_status = status.get('status')
+            # CORRECTED LINE: Access 'status' as a direct attribute
+            current_status = status.status 
             print(f"  - Polling... Current job status: {current_status}")
 
             if job.is_complete():
@@ -89,7 +90,8 @@ def transcribe_audio(
                 break
             
             if job.is_failed():
-                reason = status.get('reason')
+                # CORRECTED LINE: Access 'reason' as a direct attribute
+                reason = status.reason 
                 print(f"!!! Sarvam job failed: {reason}")
                 raise HTTPException(status_code=502, detail=f"Sarvam job failed: {reason}")
             
