@@ -1,4 +1,4 @@
-# app.py (with extensive logging and combined AI call)
+# app.py (with active polling loop)
 
 import os
 import openai
@@ -8,6 +8,7 @@ from sarvamai import SarvamAI
 import glob
 import json
 import shutil
+import time # Import the time module
 
 # --- Load Environment Variables ---
 from dotenv import load_dotenv
@@ -50,7 +51,7 @@ def read_root():
 @app.post("/transcribe")
 def transcribe_audio(
     file: UploadFile = File(...),
-    template_type: str = Form("meeting_notes") # Note: template_type is not used in this version for simplicity
+    template_type: str = Form("meeting_notes")
 ):
     temp_dir = "temp_processing"
     output_dir = os.path.join(temp_dir, "sarvam_output")
@@ -74,14 +75,31 @@ def transcribe_audio(
         job.upload_files(file_paths=[temp_audio_path])
         job.start()
         print("Step 2b: Job started. Waiting for completion...")
-        job.wait_until_complete(timeout=300)
-        print("Step 2c: Job completed.")
 
-        if job.is_failed():
-            reason = job.get_status().get('reason')
-            print(f"!!! Sarvam job failed: {reason}")
-            raise HTTPException(status_code=502, detail=f"Sarvam job failed: {reason}")
-        
+        # --- NEW POLLING LOGIC ---
+        start_time = time.time()
+        timeout = 300 # 5 minutes
+        while True:
+            status = job.get_status()
+            current_status = status.get('status')
+            print(f"  - Polling... Current job status: {current_status}")
+
+            if job.is_complete():
+                print("Step 2c: Job completed successfully.")
+                break
+            
+            if job.is_failed():
+                reason = status.get('reason')
+                print(f"!!! Sarvam job failed: {reason}")
+                raise HTTPException(status_code=502, detail=f"Sarvam job failed: {reason}")
+            
+            if time.time() - start_time > timeout:
+                print("!!! Job timed out after 300 seconds.")
+                raise HTTPException(status_code=504, detail="Transcription job timed out.")
+            
+            time.sleep(5) # Wait for 5 seconds before checking again
+        # --- END OF POLLING LOGIC ---
+
         print("Step 3: Downloading Sarvam job outputs...")
         job.download_outputs(output_dir=output_dir)
         print("Step 3b: Outputs downloaded.")
@@ -114,7 +132,7 @@ def transcribe_audio(
         
         ai_response = openai_client.chat.completions.create(
             model="gpt-4o",
-            response_format={"type": "json_object"}, # Force JSON output
+            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": "You are an assistant that processes transcripts into structured JSON data."},
                 {"role": "user", "content": prompt}
@@ -123,10 +141,8 @@ def transcribe_audio(
         
         print("Step 5b: OpenAI call successful.")
         
-        # The response content is a JSON string, so we parse it
         result_json = json.loads(ai_response.choices[0].message.content)
         summary = result_json.get("summary", "Summary could not be generated.")
-        # Join the list of action items into a single string for the app
         action_items_list = result_json.get("action_items", [])
         action_items = "\n".join(f"- {item}" for item in action_items_list) if action_items_list else "No action items were identified."
 
