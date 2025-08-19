@@ -1,124 +1,139 @@
-# app.py
+# app.py (FastAPI Server)
 
 import os
-import openai
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from sarvamai import SarvamAI
-import glob
-import json
-import shutil
-
-# --- Load Environment Variables ---
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+import httpx
+from openai import OpenAI
 from dotenv import load_dotenv
+import uvicorn
+
+# Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI()
 
-# --- Initialize API Clients ---
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+# Get API keys from environment variables
+SARVAM_AI_API_KEY = os.getenv("SARVAM_AI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not SARVAM_API_KEY or not OPENAI_API_KEY:
-    raise RuntimeError("API keys for Sarvam and OpenAI must be set.")
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+# --- NEW FUNCTION TO GENERATE ACTION ITEMS ---
+def generate_action_items(transcript: str) -> str:
+    """
+    Uses GPT-4o to extract action items from a transcript.
+    """
+    if not transcript:
+        return "No transcript provided to generate action items."
 
-# --- Helper Functions ---
-def format_diarized_transcript(sarvam_result: dict) -> str:
-    """Formats the diarized JSON from Sarvam AI into a readable string."""
-    entries = sarvam_result.get("diarized_transcript", {}).get("entries", [])
-    if not entries:
-        return sarvam_result.get("transcript", "No content found.")
+    try:
+        # This prompt is specifically designed to get a list of tasks or to-dos
+        prompt = f"""
+        Analyze the following transcript and extract a clear, concise list of action items or tasks.
+        If no specific action items are mentioned, state 'No action items were identified.'.
+        Format the output as a simple list.
 
-    formatted_lines = []
-    for entry in entries:
-        speaker = entry.get("speaker_id", "Unknown Speaker").replace('_', ' ').title()
-        text = entry.get("transcript", "")
-        formatted_lines.append(f"**{speaker}:** {text}")
-    
-    return "\n".join(formatted_lines).strip()
+        Transcript:
+        ---
+        {transcript}
+        ---
+        Action Items:
+        """
 
-def generate_summary_prompt(template_type: str, transcript: str) -> str:
-    """Generates a specific prompt for GPT-4o based on the selected template."""
-    prompts = {
-        "meeting_notes": f"Summarize the key decisions, action items, and discussion points from this transcript:\n\n{transcript}",
-        "todo_list": f"Extract all actionable tasks and to-do items from this transcript into a checklist:\n\n{transcript}",
-    }
-    return prompts.get(template_type, f"Provide a concise summary of this transcript:\n\n{transcript}")
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert assistant skilled at identifying action items from meeting transcripts."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2, # Lower temperature for more deterministic output
+            max_tokens=250,
+        )
+        action_items = response.choices[0].message.content.strip()
+        return action_items
+    except Exception as e:
+        print(f"Error generating action items: {e}")
+        return "Could not generate action items due to an error."
 
-# --- API Endpoint ---
-@app.get("/")
-def read_root():
-    return {"status": "Svar AI server is running"}
+def generate_summary(transcript: str, template_type: str) -> str:
+    """
+    Uses GPT-4o to generate a summary based on the transcript and a template.
+    """
+    if not transcript:
+        return "No transcript provided to summarize."
+
+    # Basic prompt engineering based on the template type
+    if template_type == 'To-Do List':
+        prompt_template = "Summarize the following transcript into a concise to-do list."
+    else: # Default to 'Meeting Notes'
+        prompt_template = "Summarize the key points and decisions from the following meeting transcript."
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that summarizes meeting notes."},
+                {"role": "user", "content": f"{prompt_template}\n\nTranscript:\n{transcript}"}
+            ],
+            temperature=0.5,
+            max_tokens=300,
+        )
+        summary = response.choices[0].message.content.strip()
+        return summary
+    except Exception as e:
+        print(f"Error generating summary: {e}")
+        return "Could not generate summary due to an error."
+
 
 @app.post("/transcribe")
-def transcribe_audio(
+async def transcribe_audio(
     file: UploadFile = File(...),
-    template_type: str = Form("meeting_notes")
+    template_type: str = Form("Meeting Notes")
 ):
-    temp_dir = "temp_processing"
-    output_dir = os.path.join(temp_dir, "sarvam_output")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    temp_audio_path = os.path.join(temp_dir, file.filename if file.filename else "audio.tmp")
-    
-    try:
-        with open(temp_audio_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        
-        print("Starting Sarvam AI transcription job...")
-        job = sarvam_client.speech_to_text_job.create_job(
-            language_code="en-IN",
-            model="saarika:v2.5",
-            with_timestamps=True,
-            with_diarization=True,
-        )
-        job.upload_files(file_paths=[temp_audio_path])
-        job.start()
-        job.wait_until_complete(timeout=300)
+    """
+    Receives an audio file, transcribes it, and generates a summary and action items.
+    """
+    if not SARVAM_AI_API_KEY or not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="API keys are not configured on the server.")
 
-        if job.is_failed():
-            raise HTTPException(status_code=502, detail=f"Sarvam job failed: {job.get_status().get('reason')}")
-        
-        # --- THE CORRECT METHOD ---
-        # Use download_outputs() to save the result JSON to a file.
-        job.download_outputs(output_dir=output_dir)
-        print("Transcription job outputs downloaded.")
+    sarvam_url = "https://api.sarvam.ai/v1/voice/stt"
+    headers = {
+        "Authorization": f"Bearer {SARVAM_AI_API_KEY}",
+        "language": "en",
+        "diarize": "true",
+    }
 
-        # Find the resulting JSON file in the output directory.
-        output_files = glob.glob(os.path.join(output_dir, "*.json"))
-        if not output_files:
-            raise HTTPException(status_code=404, detail="No transcript output file found from Sarvam.")
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            # 1. Get Transcript from Sarvam AI
+            files = {'file': (file.filename, await file.read(), file.content_type)}
+            response = await client.post(sarvam_url, headers=headers, files=files)
+            response.raise_for_status()
+            transcript_data = response.json()
+            transcript = transcript_data.get('text', 'Transcription failed.')
 
-        # Read the result from the JSON file.
-        with open(output_files[0]) as jf:
-            sarvam_result = json.load(jf)
-        
-        diarized_transcript_string = format_diarized_transcript(sarvam_result)
-        
-        print("Generating summary with GPT-4o...")
-        summary_prompt = generate_summary_prompt(template_type, diarized_transcript_string)
-        
-        summary_completion = openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": summary_prompt}]
-        )
-        summary = summary_completion.choices[0].message.content
-        print("Summary generated successfully.")
+            # 2. Generate Summary from Transcript
+            summary = generate_summary(transcript, template_type)
 
-        # Return a simple string for the transcript to the app.
-        return {
-            "transcript": diarized_transcript_string,
-            "summary": summary
-        }
+            # 3. GENERATE ACTION ITEMS from Transcript
+            action_items = generate_action_items(transcript)
 
-    except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        print(f"An unexpected error occurred: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+            # 4. Return all three pieces of data
+            return JSONResponse(content={
+                "transcript": transcript,
+                "summary": summary,
+                "action_items": action_items # <-- New field in the response
+            })
 
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+        except httpx.HTTPStatusError as e:
+            print(f"Error during transcription API call: {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=f"Transcription service error: {e.response.text}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            raise HTTPException(status_code=500, detail=f"An internal server error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
