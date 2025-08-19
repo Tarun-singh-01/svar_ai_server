@@ -15,12 +15,12 @@ load_dotenv()
 app = FastAPI()
 
 # --- Initialize API Clients ---
-# NOTE: Your .env file should have SARVAM_API_KEY, not SARVAM_AI_API_KEY
+# THIS WAS THE LINE WITH THE TYPO. IT IS NOW FIXED.
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SARVAM_API_KEY or not OPENAI_API_KEY:
-    raise RuntimeError("API keys for Sarvam and OpenAI must be set.")
+    raise RuntimeError("API keys for Sarvam (SARVAM_API_KEY) and OpenAI (OPENAI_API_KEY) must be set.")
 
 sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
@@ -48,7 +48,6 @@ def generate_summary_prompt(template_type: str, transcript: str) -> str:
     }
     return prompts.get(template_type, f"Provide a concise summary of this transcript:\n\n{transcript}")
 
-# --- NEW HELPER FUNCTION FOR ACTION ITEMS ---
 def generate_action_items_prompt(transcript: str) -> str:
     """Generates a specific prompt for GPT-4o to extract action items."""
     return f"""
@@ -119,7 +118,6 @@ def transcribe_audio(
         summary = summary_completion.choices[0].message.content
         print("Summary generated successfully.")
 
-        # --- NEW CODE BLOCK FOR ACTION ITEMS ---
         print("Generating action items with GPT-4o...")
         action_items_prompt = generate_action_items_prompt(diarized_transcript_string)
 
@@ -129,13 +127,11 @@ def transcribe_audio(
         )
         action_items = action_items_completion.choices[0].message.content
         print("Action items generated successfully.")
-        # --- END OF NEW CODE BLOCK ---
 
-        # Return all three pieces of data
         return {
             "transcript": diarized_transcript_string,
             "summary": summary,
-            "action_items": action_items # <-- Added new field to response
+            "action_items": action_items
         }
 
     except Exception as e:
