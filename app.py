@@ -8,7 +8,6 @@ from sarvamai import SarvamAI
 import glob
 import json
 import shutil
-import time # Import the time module
 
 # --- Load Environment Variables ---
 from dotenv import load_dotenv
@@ -75,32 +74,13 @@ def transcribe_audio(
         job.upload_files(file_paths=[temp_audio_path])
         job.start()
         print("Step 2b: Job started. Waiting for completion...")
-
-        # --- POLLING LOGIC WITH CORRECTION ---
-        start_time = time.time()
-        timeout = 300 # 5 minutes
-        while True:
-            status = job.get_status()
-            # CORRECTED LINE: Access 'status' as a direct attribute
-            current_status = status.status 
-            print(f"  - Polling... Current job status: {current_status}")
-
-            if job.is_complete():
-                print("Step 2c: Job completed successfully.")
-                break
-            
-            if job.is_failed():
-                # CORRECTED LINE: Access 'reason' as a direct attribute
-                reason = status.reason 
-                print(f"!!! Sarvam job failed: {reason}")
-                raise HTTPException(status_code=502, detail=f"Sarvam job failed: {reason}")
-            
-            if time.time() - start_time > timeout:
-                print("!!! Job timed out after 300 seconds.")
-                raise HTTPException(status_code=504, detail="Transcription job timed out.")
-            
-            time.sleep(5) # Wait for 5 seconds before checking again
-        # --- END OF POLLING LOGIC ---
+        final_status = job.wait_until_complete()
+        
+        if job.is_failed():
+            print("!!! Sarvam job failed.")
+            raise HTTPException(status_code=502, detail="Sarvam transcription job failed.")
+        
+        print("Step 2c: Job completed successfully.")
 
         print("Step 3: Downloading Sarvam job outputs...")
         job.download_outputs(output_dir=output_dir)
